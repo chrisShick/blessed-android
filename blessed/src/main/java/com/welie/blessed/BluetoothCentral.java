@@ -31,12 +31,15 @@ import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelUuid;
-import android.util.Log;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -46,12 +49,13 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import timber.log.Timber;
+
 /**
  * Central class to connect and communicate with bluetooth peripherals.
  */
-@SuppressWarnings("SpellCheckingInspection")
+@SuppressWarnings({"SpellCheckingInspection", "unused", "WeakerAccess"})
 public class BluetoothCentral {
-    private final String TAG = BluetoothCentral.class.getSimpleName();
 
     // Private constants
     private static final long SCAN_TIMEOUT = 180_000L;
@@ -59,8 +63,36 @@ public class BluetoothCentral {
     private static final int MAX_CONNECTION_RETRIES = 1;
     private static final int MAX_CONNECTED_PERIPHERALS = 7;
 
-    // Scanning error codes
+    /**
+     * Failed to start scan as BLE scan with the same settings is already started by the app.
+     */
+    public static final int SCAN_FAILED_ALREADY_STARTED = 1;
+
+    /**
+     * Failed to start scan as app cannot be registered.
+     */
+    public static final int SCAN_FAILED_APPLICATION_REGISTRATION_FAILED = 2;
+
+    /**
+     * Failed to start scan due an internal error
+     */
+    public static final int SCAN_FAILED_INTERNAL_ERROR = 3;
+
+    /**
+     * Failed to start power optimized scan as this feature is not supported.
+     */
+    public static final int SCAN_FAILED_FEATURE_UNSUPPORTED = 4;
+
+    /**
+     * Failed to start scan as it is out of hardware resources.
+     */
     public static final int SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES = 5;
+
+    /**
+     * Failed to start scan as application tries to scan too frequently.
+     */
+    public static final int SCAN_FAILED_SCANNING_TOO_FREQUENTLY = 6;
+
 
     // Private variables
     private final Context context;
@@ -74,9 +106,8 @@ public class BluetoothCentral {
     private final List<String> reconnectPeripheralAddresses = new ArrayList<>();
     private final Map<String, BluetoothPeripheralCallback> reconnectCallbacks = new ConcurrentHashMap<>();
     private String[] scanPeripheralNames;
-    private final Handler timeoutHandler = new Handler();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private Runnable timeoutRunnable;
-    private final Handler autoConnectHandler = new Handler();
     private Runnable autoConnectRunnable;
     private final Object connectLock = new Object();
     private ScanCallback currentCallback;
@@ -84,31 +115,30 @@ public class BluetoothCentral {
     private ScanSettings scanSettings;
     private final ScanSettings autoConnectScanSettings;
     private final Map<String, Integer> connectionRetries = new ConcurrentHashMap<>();
+    private boolean expectingBluetoothOffDisconnects = false;
+    private Runnable disconnectRunnable;
 
     //region Callbacks
 
-    /**
-     * Callback for scan by peripheral name. Do substring filtering before forwarding result.
-     */
     private final ScanCallback scanByNameCallback = new ScanCallback() {
         @Override
         public void onScanResult(int callbackType, final ScanResult result) {
             synchronized (this) {
                 String deviceName = result.getDevice().getName();
-                if (deviceName != null) {
-                    for (String name : scanPeripheralNames) {
-                        if (deviceName.contains(name)) {
-                            callBackHandler.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if (currentCallback != null) {
-                                        BluetoothPeripheral peripheral = new BluetoothPeripheral(context, result.getDevice(), internalCallback, null, callBackHandler);
-                                        bluetoothCentralCallback.onDiscoveredPeripheral(peripheral, result);
-                                    }
+                if (deviceName == null) return;
+
+                for (String name : scanPeripheralNames) {
+                    if (deviceName.contains(name)) {
+                        callBackHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (isScanning()) {
+                                    BluetoothPeripheral peripheral = new BluetoothPeripheral(context, result.getDevice(), internalCallback, null, callBackHandler);
+                                    bluetoothCentralCallback.onDiscoveredPeripheral(peripheral, result);
                                 }
-                            });
-                            return;
-                        }
+                            }
+                        });
+                        return;
                     }
                 }
             }
@@ -116,7 +146,7 @@ public class BluetoothCentral {
 
         @Override
         public void onScanFailed(final int errorCode) {
-            Log.e(TAG, String.format("scan failed with error code %d", errorCode));
+            Timber.e("scan failed with error code %d (%s)", errorCode, scanErrorToString(errorCode));
             callBackHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -126,9 +156,6 @@ public class BluetoothCentral {
         }
     };
 
-    /**
-     * Callback for scan by service UUID
-     */
     private final ScanCallback scanByServiceUUIDCallback = new ScanCallback() {
         @Override
         public void onScanResult(int callbackType, final ScanResult result) {
@@ -136,7 +163,7 @@ public class BluetoothCentral {
                 callBackHandler.post(new Runnable() {
                     @Override
                     public void run() {
-                        if (currentCallback != null) {
+                        if (isScanning()) {
                             BluetoothPeripheral peripheral = new BluetoothPeripheral(context, result.getDevice(), internalCallback, null, callBackHandler);
                             bluetoothCentralCallback.onDiscoveredPeripheral(peripheral, result);
                         }
@@ -147,7 +174,7 @@ public class BluetoothCentral {
 
         @Override
         public void onScanFailed(final int errorCode) {
-            Log.e(TAG, String.format("scan failed with error code %d", errorCode));
+            Timber.e("scan failed with error code %d (%s)", errorCode, scanErrorToString(errorCode));
             callBackHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -161,26 +188,21 @@ public class BluetoothCentral {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
             synchronized (this) {
-                // Get the deviceAdress and corresponding callback
+                if (!isAutoScanning()) return;
+
+                Timber.d("peripheral with address '%s' found", result.getDevice().getAddress());
+                stopAutoconnectScan();
+
                 String deviceAddress = result.getDevice().getAddress();
-                Log.d(TAG, String.format("peripheral with address '%s' found", deviceAddress));
+                BluetoothPeripheral peripheral = unconnectedPeripherals.get(deviceAddress);
                 BluetoothPeripheralCallback callback = reconnectCallbacks.get(deviceAddress);
 
-                // Clean up first
                 reconnectPeripheralAddresses.remove(deviceAddress);
                 reconnectCallbacks.remove(deviceAddress);
+                unconnectedPeripherals.remove(deviceAddress);
 
-                // If we have all devices, stop the scan
-                if (reconnectPeripheralAddresses.size() == 0) {
-                    autoConnectScanner.stopScan(autoConnectScanCallback);
-                    autoConnectScanner = null;
-                    cancelAutoConnectTimer();
-                }
+                connectPeripheral(peripheral, callback);
 
-                // The device is now cached so issue normal connect
-                connectPeripheral(getPeripheral(deviceAddress), callback);
-
-                // If there are any devices left, restart the reconnection scan
                 if (reconnectPeripheralAddresses.size() > 0) {
                     scanForAutoConnectPeripherals();
                 }
@@ -189,7 +211,7 @@ public class BluetoothCentral {
 
         @Override
         public void onScanFailed(final int errorCode) {
-            Log.e(TAG, String.format("autoconnect scan failed with error code %d", errorCode));
+            Timber.e("scan failed with error code %d (%s)", errorCode, scanErrorToString(errorCode));
             callBackHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -199,33 +221,17 @@ public class BluetoothCentral {
         }
     };
 
-    /**
-     * Callback from each connected peripheral
-     */
     private final BluetoothPeripheral.InternalCallback internalCallback = new BluetoothPeripheral.InternalCallback() {
 
-        /**
-         * Successfully connected with the peripheral, add it to the connected peripherals list
-         * and notify the listener.
-         * @param peripheral {@link BluetoothPeripheral} that connected.
-         */
         @Override
         public void connected(final BluetoothPeripheral peripheral) {
-            // Remove peripheral from retry map if it is there
             connectionRetries.remove(peripheral.getAddress());
-
-            // Do some administration work
+            unconnectedPeripherals.remove(peripheral.getAddress());
             connectedPeripherals.put(peripheral.getAddress(), peripheral);
             if (connectedPeripherals.size() == MAX_CONNECTED_PERIPHERALS) {
-                Log.w(TAG, String.format("maximum amount (%d) of connected peripherals reached", MAX_CONNECTED_PERIPHERALS));
+                Timber.w("maximum amount (%d) of connected peripherals reached", MAX_CONNECTED_PERIPHERALS);
             }
 
-            // Remove peripheral from unconnected peripherals map if it is there
-            if (unconnectedPeripherals.get(peripheral.getAddress()) != null) {
-                unconnectedPeripherals.remove(peripheral.getAddress());
-            }
-
-            // Inform the listener that we are now connected
             callBackHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -234,17 +240,9 @@ public class BluetoothCentral {
             });
         }
 
-        /**
-         * The connection with the peripheral failed, remove it from the connected peripheral list
-         * and notify the listener.
-         * @param peripheral {@link BluetoothPeripheral} of which connect failed.
-         */
         @Override
         public void connectFailed(final BluetoothPeripheral peripheral, final int status) {
-            // Remove from unconnected peripherals list
-            if (unconnectedPeripherals.get(peripheral.getAddress()) != null) {
-                unconnectedPeripherals.remove(peripheral.getAddress());
-            }
+            unconnectedPeripherals.remove(peripheral.getAddress());
 
             // Get the number of retries for this peripheral
             int nrRetries = 0;
@@ -255,7 +253,7 @@ public class BluetoothCentral {
 
             // Retry connection or conclude the connection has failed
             if (nrRetries < MAX_CONNECTION_RETRIES && status != BluetoothPeripheral.GATT_CONN_TIMEOUT) {
-                Log.i(TAG, String.format("retrying connection to '%s' (%s)", peripheral.getName(), peripheral.getAddress()));
+                Timber.i("retrying connection to '%s' (%s)", peripheral.getName(), peripheral.getAddress());
                 nrRetries++;
                 connectionRetries.put(peripheral.getAddress(), nrRetries);
                 unconnectedPeripherals.put(peripheral.getAddress(), peripheral);
@@ -263,7 +261,7 @@ public class BluetoothCentral {
                 // Retry with autoconnect
                 peripheral.autoConnect();
             } else {
-                Log.i(TAG, String.format("connection to '%s' (%s) failed", peripheral.getName(), peripheral.getAddress()));
+                Timber.i("connection to '%s' (%s) failed", peripheral.getName(), peripheral.getAddress());
                 callBackHandler.post(new Runnable() {
                     @Override
                     public void run() {
@@ -273,22 +271,16 @@ public class BluetoothCentral {
             }
         }
 
-        /**
-         * The peripheral disconnected, remove it from the connected peripherals list
-         * and notify the listener.
-         * @param peripheral {@link BluetoothPeripheral} that disconnected.
-         */
         @Override
         public void disconnected(final BluetoothPeripheral peripheral, final int status) {
-            // Remove it from the connected peripherals map
-            connectedPeripherals.remove(peripheral.getAddress());
-
-            // Make sure it is also not in unconnected peripherals map
-            if (unconnectedPeripherals.get(peripheral.getAddress()) != null) {
-                unconnectedPeripherals.remove(peripheral.getAddress());
+            if (expectingBluetoothOffDisconnects) {
+                cancelDisconnectionTimer();
+                expectingBluetoothOffDisconnects = false;
             }
 
-            // Trigger callback
+            connectedPeripherals.remove(peripheral.getAddress());
+            unconnectedPeripherals.remove(peripheral.getAddress());
+
             callBackHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -309,10 +301,10 @@ public class BluetoothCentral {
      */
     public BluetoothCentral(Context context, BluetoothCentralCallback bluetoothCentralCallback, Handler handler) {
         if (context == null) {
-            Log.e(TAG, "context is 'null', cannot create BluetoothCentral");
+            Timber.e("context is 'null', cannot create BluetoothCentral");
         }
         if (bluetoothCentralCallback == null) {
-            Log.e(TAG, "callback is 'null', cannot create BluetoothCentral");
+            Timber.e("callback is 'null', cannot create BluetoothCentral");
         }
         this.context = context;
         this.bluetoothCentralCallback = bluetoothCentralCallback;
@@ -337,8 +329,27 @@ public class BluetoothCentral {
                     .build();
         }
         setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY);
+
+        // Register for broadcasts on BluetoothAdapter state change
+        IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
+        if (context != null) {
+            context.registerReceiver(adapterStateReceiver, filter);
+        }
     }
 
+    /**
+     * Closes BluetoothCentral and cleans up internals. BluetoothCentral will not work anymore after this is called.
+     */
+    public void close() {
+        unconnectedPeripherals.clear();
+        connectedPeripherals.clear();
+        reconnectCallbacks.clear();
+        reconnectPeripheralAddresses.clear();
+        if (context != null) {
+            context.unregisterReceiver(adapterStateReceiver);
+        }
+    }
+    
     /**
      * Set the default scanMode.
      *
@@ -377,9 +388,9 @@ public class BluetoothCentral {
         if (!isBleReady()) return;
 
         // Make sure we are not already scanning, we only want one scan at the time
-        if (currentCallback != null) {
-            Log.e(TAG, "other scan still active, please stop other scan first");
-            return;
+        if (isScanning()) {
+            Timber.e("other scan still active, stopping scan");
+            stopScan();
         }
 
         // Get a new scanner object
@@ -394,19 +405,18 @@ public class BluetoothCentral {
             currentCallback = scanCallback;
             currentFilters = filters;
             bluetoothScanner.startScan(filters, scanSettings, scanCallback);
-            Log.i(TAG, "scan started");
+            Timber.i("scan started");
         } else {
-            Log.e(TAG, "starting scan failed");
+            Timber.e("starting scan failed");
         }
     }
 
     /**
-     * Scan for peripherals that advertise at least one of the specified service UUIDs
+     * Scan for peripherals that advertise at least one of the specified service UUIDs.
      *
      * @param serviceUUIDs an array of service UUIDs
      */
     public void scanForPeripheralsWithServices(final UUID[] serviceUUIDs) {
-        // Build filters list
         currentFilters = null;
         if (serviceUUIDs != null) {
             currentFilters = new ArrayList<>();
@@ -417,6 +427,7 @@ public class BluetoothCentral {
                 currentFilters.add(filter);
             }
         }
+
         startScan(currentFilters, scanSettings, scanByServiceUUIDCallback);
     }
 
@@ -434,12 +445,11 @@ public class BluetoothCentral {
     }
 
     /**
-     * Scan for peripherals that have any of the specified peripheral mac addresses
+     * Scan for peripherals that have any of the specified peripheral mac addresses.
      *
      * @param peripheralAddresses array of peripheral mac addresses to scan for
      */
     public void scanForPeripheralsWithAddresses(final String[] peripheralAddresses) {
-        // Build filters list
         List<ScanFilter> filters = null;
         if (peripheralAddresses != null) {
             filters = new ArrayList<>();
@@ -450,15 +460,16 @@ public class BluetoothCentral {
                             .build();
                     filters.add(filter);
                 } else {
-                    Log.e(TAG, String.format("%s is not a valid address. Make sure all alphabetic characters are uppercase.", address));
+                    Timber.e("%s is not a valid address. Make sure all alphabetic characters are uppercase.", address);
                 }
             }
         }
+
         startScan(filters, scanSettings, scanByServiceUUIDCallback);
     }
 
     /**
-     * Scan for any peripheral that is advertising
+     * Scan for any peripheral that is advertising.
      */
     public void scanForPeripherals() {
         startScan(null, scanSettings, scanByServiceUUIDCallback);
@@ -473,49 +484,70 @@ public class BluetoothCentral {
 
         // Stop previous autoconnect scans if any
         if (autoConnectScanner != null) {
-            autoConnectScanner.stopScan(autoConnectScanCallback);
-            autoConnectScanner = null;
-            cancelAutoConnectTimer();
+            stopAutoconnectScan();
         }
 
         // Start the scanner
         autoConnectScanner = bluetoothAdapter.getBluetoothLeScanner();
         if (autoConnectScanner != null) {
-            List<ScanFilter> filters = null;
-            if (reconnectPeripheralAddresses != null) {
-                filters = new ArrayList<>();
-                for (String address : reconnectPeripheralAddresses) {
-                    ScanFilter filter = new ScanFilter.Builder()
-                            .setDeviceAddress(address)
-                            .build();
-                    filters.add(filter);
-                }
+            List<ScanFilter> filters;
+            filters = new ArrayList<>();
+            for (String address : reconnectPeripheralAddresses) {
+                ScanFilter filter = new ScanFilter.Builder()
+                        .setDeviceAddress(address)
+                        .build();
+                filters.add(filter);
             }
 
             // Start the scanner
             autoConnectScanner.startScan(filters, autoConnectScanSettings, autoConnectScanCallback);
+            Timber.d("started scanning to autoconnect peripherals (" + reconnectPeripheralAddresses.size() + ")");
             setAutoConnectTimer();
         } else {
-            Log.e(TAG, "starting autoconnect scan failed");
+            Timber.e("starting autoconnect scan failed");
         }
     }
 
+    private void stopAutoconnectScan() {
+        cancelAutoConnectTimer();
+        if (autoConnectScanner != null) {
+            autoConnectScanner.stopScan(autoConnectScanCallback);
+            autoConnectScanner = null;
+            Timber.i("autoscan stopped");
+        }
+    }
+
+    private boolean isAutoScanning() {
+        return autoConnectScanner != null;
+    }
+
     /**
-     * Stop scanning for peripherals
+     * Stop scanning for peripherals.
      */
     public void stopScan() {
         cancelTimeoutTimer();
-        if (bluetoothScanner != null) {
+        if (isScanning()) {
             bluetoothScanner.stopScan(currentCallback);
-            Log.i(TAG, "scan stopped");
+            Timber.i("scan stopped");
+        } else {
+            Timber.i("no scan to stop because no scan is running");
         }
         currentCallback = null;
         currentFilters = null;
     }
 
     /**
-     * Connect to a known peripheral immediately. The peripheral must have been found by scanning for this call to succeed. This method will time out in max 30 seconds.
-     * If the peripheral is already connected, no connection attempt will be made. This method is asynchronous.
+     * Check if a scanning is active
+     *
+     * @return true if a scan is active, otherwise false
+     */
+    public boolean isScanning() {
+        return (bluetoothScanner != null && currentCallback != null);
+    }
+
+    /**
+     * Connect to a known peripheral immediately. The peripheral must have been found by scanning for this call to succeed. This method will time out in max 30 seconds on most phones and in 5 seconds on Samsung phones.
+     * If the peripheral is already connected, no connection attempt will be made. This method is asynchronous and there can be only one outstanding connect.
      *
      * @param peripheral BLE peripheral to connect with
      */
@@ -523,19 +555,19 @@ public class BluetoothCentral {
         synchronized (connectLock) {
             // Make sure peripheral is valid
             if (peripheral == null) {
-                Log.e(TAG, "no valid peripheral specified, aborting connection");
+                Timber.e("no valid peripheral specified, aborting connection");
                 return;
             }
 
             // Check if we are already connected to this peripheral
             if (connectedPeripherals.containsKey(peripheral.getAddress())) {
-                Log.w(TAG, String.format("already connected to %s'", peripheral.getAddress()));
+                Timber.w("already connected to %s'", peripheral.getAddress());
                 return;
             }
 
             // Check if we already have an outstanding connection request for this peripheral
             if (unconnectedPeripherals.containsKey(peripheral.getAddress())) {
-                Log.w(TAG, String.format("already connecting to %s'", peripheral.getAddress()));
+                Timber.w("already connecting to %s'", peripheral.getAddress());
                 return;
             }
 
@@ -543,7 +575,7 @@ public class BluetoothCentral {
             int deviceType = peripheral.getType();
             if (deviceType == BluetoothDevice.DEVICE_TYPE_UNKNOWN) {
                 // The peripheral is not cached so connection is likely to fail
-                Log.w(TAG, String.format("peripheral with address '%s' is not in the Bluetooth cache, hence connection may fail", peripheral.getAddress()));
+                Timber.w("peripheral with address '%s' is not in the Bluetooth cache, hence connection may fail", peripheral.getAddress());
             }
 
             // It is all looking good! Set the callback and prepare to connect
@@ -561,23 +593,22 @@ public class BluetoothCentral {
      * @param peripheral the peripheral
      */
     public void autoConnectPeripheral(BluetoothPeripheral peripheral, BluetoothPeripheralCallback peripheralCallback) {
-        // Make sure we are the only ones executing this method
         synchronized (connectLock) {
             // Make sure peripheral is valid
             if (peripheral == null) {
-                Log.e(TAG, "no valid peripheral specified, aborting connection");
+                Timber.e("no valid peripheral specified, aborting connection");
                 return;
             }
 
             // Check if we are already connected to this peripheral
             if (connectedPeripherals.containsKey(peripheral.getAddress())) {
-                Log.w(TAG, String.format("already connected to %s'", peripheral.getAddress()));
+                Timber.w("already connected to %s'", peripheral.getAddress());
                 return;
             }
 
             // Check if we are not already asking this peripheral for data
             if (unconnectedPeripherals.get(peripheral.getAddress()) != null) {
-                Log.w(TAG, String.format("already issued autoconnect for '%s' ", peripheral.getAddress()));
+                Timber.w("already issued autoconnect for '%s' ", peripheral.getAddress());
                 return;
             }
 
@@ -585,7 +616,8 @@ public class BluetoothCentral {
             int deviceType = peripheral.getType();
             if (deviceType == BluetoothDevice.DEVICE_TYPE_UNKNOWN) {
                 // The peripheral is not cached so we cannot autoconnect
-                Log.d(TAG, String.format("peripheral with address '%s' not in Bluetooth cache, autoconnecting by scanning", peripheral.getAddress()));
+                Timber.d("peripheral with address '%s' not in Bluetooth cache, autoconnecting by scanning", peripheral.getAddress());
+                unconnectedPeripherals.put(peripheral.getAddress(), peripheral);
                 autoConnectPeripheralByScan(peripheral.getAddress(), peripheralCallback);
                 return;
             }
@@ -593,7 +625,7 @@ public class BluetoothCentral {
             // Check if the peripheral supports BLE
             if (!(deviceType == BluetoothDevice.DEVICE_TYPE_LE || deviceType == BluetoothDevice.DEVICE_TYPE_DUAL)) {
                 // This device does not support Bluetooth LE, so we cannot connect
-                Log.e(TAG, "peripheral does not support Bluetooth LE");
+                Timber.e("peripheral does not support Bluetooth LE");
                 return;
             }
 
@@ -609,42 +641,35 @@ public class BluetoothCentral {
     private void autoConnectPeripheralByScan(String peripheralAddress, BluetoothPeripheralCallback peripheralCallback) {
         // Check if this peripheral is already on the list or not
         if (reconnectPeripheralAddresses.contains(peripheralAddress)) {
-            Log.w(TAG, "peripheral already on list for reconnection");
+            Timber.w("peripheral already on list for reconnection");
             return;
         }
 
-        // Add this peripheral to the list
         reconnectPeripheralAddresses.add(peripheralAddress);
         reconnectCallbacks.put(peripheralAddress, peripheralCallback);
-
-        // Scan to peripherals that need to be autoConnected
         scanForAutoConnectPeripherals();
     }
 
     /**
-     * Cancel an active or pending connection for a peripheral
+     * Cancel an active or pending connection for a peripheral.
      *
      * @param peripheral the peripheral
      */
     public void cancelConnection(final BluetoothPeripheral peripheral) {
         // Check if peripheral is valid
         if (peripheral == null) {
-            Log.e(TAG, "cannot cancel connection, peripheral is null");
+            Timber.e("cannot cancel connection, peripheral is null");
             return;
         }
 
-        // Get the peripheral address
-        String peripheralAddress = peripheral.getAddress();
-
         // First check if we are doing a reconnection scan for this peripheral
+        String peripheralAddress = peripheral.getAddress();
         if (reconnectPeripheralAddresses.contains(peripheralAddress)) {
             // Clean up first
             reconnectPeripheralAddresses.remove(peripheralAddress);
             reconnectCallbacks.remove(peripheralAddress);
-            autoConnectScanner.stopScan(autoConnectScanCallback);
-            autoConnectScanner = null;
-            cancelAutoConnectTimer();
-            Log.d(TAG, String.format("cancelling autoconnect for %s", peripheralAddress));
+            stopAutoconnectScan();
+            Timber.d("cancelling autoconnect for %s", peripheralAddress);
 
             // If there are any devices left, restart the reconnection scan
             if (reconnectPeripheralAddresses.size() > 0) {
@@ -677,25 +702,66 @@ public class BluetoothCentral {
                 connectedPeripheral.cancelConnection();
             }
         } else {
-            Log.e(TAG, String.format("cannot cancel connection to unknown peripheral %s", peripheralAddress));
+            Timber.e("cannot cancel connection to unknown peripheral %s", peripheralAddress);
         }
     }
 
+    /**
+     * Autoconnect to a batch of peripherals.
+     *
+     * Use this function to autoConnect to a batch of peripherals, instead of calling autoConnect on each of them.
+     * Calling autoConnect on many peripherals may cause Android scanning limits to kick in, which is avoided by using autoConnectPeripheralsBatch.
+     *
+     * @param peripherals the list of peripherals to autoconnect to
+     * @param bluetoothPeripheralCallback the callback to use for each device
+     */
+    public void autoConnectPeripheralsBatch(List<BluetoothPeripheral> peripherals, BluetoothPeripheralCallback bluetoothPeripheralCallback) {
+        List<BluetoothPeripheral> uncachedPeripherals = new ArrayList<>();
+        List<BluetoothPeripheral> cachedPeripherals = new ArrayList<>();
+
+        // Split the list in cached and uncached peripherals
+        for (BluetoothPeripheral peripheral : peripherals) {
+            if (peripheral.getType() == BluetoothDevice.DEVICE_TYPE_UNKNOWN) {
+                uncachedPeripherals.add(peripheral);
+            } else {
+                cachedPeripherals.add(peripheral);
+            }
+        }
+
+        // Issue autoconnect for cached peripherals
+        for (BluetoothPeripheral peripheral : cachedPeripherals) {
+            autoConnectPeripheral(peripheral, bluetoothPeripheralCallback);
+        }
+
+        // Add uncached peripherals to list of peripherals to scan for
+        if(uncachedPeripherals.size() > 0) {
+            for (BluetoothPeripheral peripheral : uncachedPeripherals) {
+                String peripheralAddress = peripheral.getAddress();
+
+                // Check if this peripheral is already on the list or not
+                if (reconnectPeripheralAddresses.contains(peripheralAddress)) {
+                    Timber.w("peripheral already on list for reconnection");
+                } else {
+                    reconnectPeripheralAddresses.add(peripheralAddress);
+                }
+                reconnectCallbacks.put(peripheralAddress, bluetoothPeripheralCallback);
+            }
+            scanForAutoConnectPeripherals();
+        }
+    }
 
     /**
-     * Get a peripheral object matching the specified mac address
+     * Get a peripheral object matching the specified mac address.
      *
      * @param peripheralAddress mac address
      * @return a BluetoothPeripheral object matching the specified mac address or null if it was not found
      */
     public BluetoothPeripheral getPeripheral(String peripheralAddress) {
-        // Check if it is valid address
         if (!BluetoothAdapter.checkBluetoothAddress(peripheralAddress)) {
-            Log.e(TAG, String.format("%s is not a valid address. Make sure all alphabetic characters are uppercase.", peripheralAddress));
+            Timber.e("%s is not a valid address. Make sure all alphabetic characters are uppercase.", peripheralAddress);
             return null;
         }
 
-        // Lookup or create BluetoothPeripheral object
         if (connectedPeripherals.containsKey(peripheralAddress)) {
             return connectedPeripherals.get(peripheralAddress);
         } else if (unconnectedPeripherals.containsKey(peripheralAddress)) {
@@ -706,7 +772,7 @@ public class BluetoothCentral {
     }
 
     /**
-     * Get the list of connected peripherals
+     * Get the list of connected peripherals.
      *
      * @return list of connected peripherals
      */
@@ -728,7 +794,7 @@ public class BluetoothCentral {
             return true;
         }
 
-        Log.e(TAG, "BLE not supported");
+        Timber.e("BLE not supported");
         return false;
     }
 
@@ -736,15 +802,22 @@ public class BluetoothCentral {
         if (bluetoothAdapter.isEnabled()) {
             return true;
         }
-        Log.e(TAG, "Bluetooth disabled");
+        Timber.e("Bluetooth disabled");
         return false;
     }
 
     private boolean permissionsGranted() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
-                && context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            Log.e(TAG, "no location permission, cannot scan");
-            return false;
+        int targetSdkVersion = context.getApplicationInfo().targetSdkVersion;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && targetSdkVersion >= Build.VERSION_CODES.Q) {
+            if (context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                Timber.e("no ACCESS_FINE_LOCATION permission, cannot scan");
+                return false;
+            } else return true;
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                Timber.e("no ACCESS_COARSE_LOCATION permission, cannot scan");
+                return false;
+            } else return true;
         } else {
             return true;
         }
@@ -755,14 +828,12 @@ public class BluetoothCentral {
      * If timeout is executed the scan is stopped and automatically restarted. This is done to avoid Android 9 scan restrictions
      */
     private void setScanTimer() {
-        // Cancel runnable if it exists
         cancelTimeoutTimer();
 
-        // Prepare runnable
         timeoutRunnable = new Runnable() {
             @Override
             public void run() {
-                Log.d(TAG, "scanning timeout, restarting scan");
+                Timber.d("scanning timeout, restarting scan");
                 final ScanCallback callback = currentCallback;
                 final List<ScanFilter> filters = currentFilters;
                 stopScan();
@@ -777,8 +848,7 @@ public class BluetoothCentral {
             }
         };
 
-        // Start timer
-        timeoutHandler.postDelayed(timeoutRunnable, SCAN_TIMEOUT);
+        mainHandler.postDelayed(timeoutRunnable, SCAN_TIMEOUT);
     }
 
     /**
@@ -786,7 +856,7 @@ public class BluetoothCentral {
      */
     private void cancelTimeoutTimer() {
         if (timeoutRunnable != null) {
-            timeoutHandler.removeCallbacks(timeoutRunnable);
+            mainHandler.removeCallbacks(timeoutRunnable);
             timeoutRunnable = null;
         }
     }
@@ -796,14 +866,11 @@ public class BluetoothCentral {
      * If timeout is executed the scan is stopped and automatically restarted. This is done to avoid Android 9 scan restrictions
      */
     private void setAutoConnectTimer() {
-        // Cancel runnanle if it exists
         cancelAutoConnectTimer();
-
-        // Prepare autoconnect runnable
         autoConnectRunnable = new Runnable() {
             @Override
             public void run() {
-                Log.d(TAG, "autoconnect scan timeout, restarting scan");
+                Timber.d("autoconnect scan timeout, restarting scan");
 
                 // Stop previous autoconnect scans if any
                 if (autoConnectScanner != null) {
@@ -812,7 +879,7 @@ public class BluetoothCentral {
                 }
 
                 // Restart the auto connect scan and timer
-                callBackHandler.postDelayed(new Runnable() {
+                mainHandler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
                         scanForAutoConnectPeripherals();
@@ -821,8 +888,7 @@ public class BluetoothCentral {
             }
         };
 
-        // Start autoconnect timer
-        autoConnectHandler.postDelayed(autoConnectRunnable, SCAN_TIMEOUT);
+        mainHandler.postDelayed(autoConnectRunnable, SCAN_TIMEOUT);
     }
 
     /**
@@ -830,13 +896,13 @@ public class BluetoothCentral {
      */
     private void cancelAutoConnectTimer() {
         if (autoConnectRunnable != null) {
-            autoConnectHandler.removeCallbacks(autoConnectRunnable);
+            mainHandler.removeCallbacks(autoConnectRunnable);
             autoConnectRunnable = null;
         }
     }
 
     /**
-     * Remove bond for a peripheral
+     * Remove bond for a peripheral.
      *
      * @param peripheralAddress the address of the peripheral
      * @return true if the peripheral was succesfully unpaired or it wasn't paired, false if it was paired and removing it failed
@@ -865,11 +931,11 @@ public class BluetoothCentral {
                 Method method = peripheralToUnBond.getClass().getMethod("removeBond", (Class[]) null);
                 result = (boolean) method.invoke(peripheralToUnBond, (Object[]) null);
                 if (result) {
-                    Log.i(TAG, String.format("Succesfully removed bond for '%s'", peripheralToUnBond.getName()));
+                    Timber.i("Succesfully removed bond for '%s'", peripheralToUnBond.getName());
                 }
                 return result;
             } catch (Exception e) {
-                Log.i(TAG, "could not remove bond");
+                Timber.i("could not remove bond");
                 e.printStackTrace();
                 return false;
             }
@@ -878,10 +944,10 @@ public class BluetoothCentral {
         }
     }
 
-    /*
+    /**
      * Make the pairing popup appear in the foreground by doing a 1 sec discovery.
-     * If the pairing popup is shown within 60 seconds, it will be shown in the foreground
-     *
+     * <p>
+     * If the pairing popup is shown within 60 seconds, it will be shown in the foreground.
      */
     public void startPairingPopupHack() {
         // Check if we are on a Samsung device because those don't need the hack
@@ -892,10 +958,133 @@ public class BluetoothCentral {
             callBackHandler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    Log.d(TAG, "popup hack completed");
+                    Timber.d("popup hack completed");
                     bluetoothAdapter.cancelDiscovery();
                 }
             }, 1000);
+        }
+    }
+
+
+    /**
+     * Some phones, like Google/Pixel phones, don't automatically disconnect devices so this method does it manually
+     */
+    private void cancelAllConnectionsWhenBluetoothOff() {
+        Timber.d("disconnect all peripherals because bluetooth is off");
+        // Call cancelConnection for connected peripherals
+        for (final BluetoothPeripheral peripheral : connectedPeripherals.values()) {
+            peripheral.disconnectWhenBluetoothOff();
+        }
+        connectedPeripherals.clear();
+
+        // Call cancelConnection for unconnected peripherals
+        for (final BluetoothPeripheral peripheral : unconnectedPeripherals.values()) {
+            peripheral.disconnectWhenBluetoothOff();
+        }
+        unconnectedPeripherals.clear();
+
+        // Clean up autoconnect by scanning information
+        reconnectPeripheralAddresses.clear();
+        reconnectCallbacks.clear();
+    }
+
+    /**
+     * Timer to determine if manual disconnection in case of bluetooth off is needed
+     */
+    private void startDisconnectionTimer() {
+        cancelDisconnectionTimer();
+        disconnectRunnable = new Runnable() {
+            @Override
+            public void run() {
+                Timber.e("bluetooth turned off but no automatic disconnects happening, so doing it ourselves");
+                cancelAllConnectionsWhenBluetoothOff();
+                disconnectRunnable = null;
+            }
+        };
+
+        mainHandler.postDelayed(disconnectRunnable, 1000);
+    }
+
+    /**
+     * Cancel timer for bluetooth off disconnects
+     */
+    private void cancelDisconnectionTimer() {
+        if (disconnectRunnable != null) {
+            mainHandler.removeCallbacks(disconnectRunnable);
+            disconnectRunnable = null;
+        }
+    }
+
+    private final BroadcastReceiver adapterStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            final String action = intent.getAction();
+            if (action == null) return;
+
+            if (action.equals(BluetoothAdapter.ACTION_STATE_CHANGED)) {
+                final int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
+                callBackHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        bluetoothCentralCallback.onBluetoothAdapterStateChanged(state);
+                    }
+                });
+
+                handleAdapterState(state);
+            }
+        }
+    };
+
+    private void handleAdapterState(int state) {
+        switch (state) {
+            case BluetoothAdapter.STATE_OFF:
+                // Check if there are any connected peripherals or connections in progress
+                if (connectedPeripherals.size() > 0 || unconnectedPeripherals.size() > 0) {
+                    // See if they are automatically disconnect
+                    expectingBluetoothOffDisconnects = true;
+                    startDisconnectionTimer();
+                }
+                Timber.d("bluetooth turned off");
+                break;
+            case BluetoothAdapter.STATE_TURNING_OFF:
+                expectingBluetoothOffDisconnects = true;
+
+                // Stop all scans so that we are back in a clean state
+                // Note that we can't call stopScan if the adapter is off
+                cancelTimeoutTimer();
+                cancelAutoConnectTimer();
+                currentCallback = null;
+                currentFilters = null;
+                autoConnectScanner = null;
+                Timber.d("bluetooth turning off");
+                break;
+            case BluetoothAdapter.STATE_ON:
+                expectingBluetoothOffDisconnects = false;
+                Timber.d("bluetooth turned on");
+                break;
+            case BluetoothAdapter.STATE_TURNING_ON:
+                expectingBluetoothOffDisconnects = false;
+                Timber.d("bluetooth turning on");
+                break;
+        }
+    }
+
+    private String scanErrorToString(final int errorCode) {
+        switch (errorCode) {
+            case SCAN_FAILED_ALREADY_STARTED:
+                return "ALREADY STARTED";
+            case SCAN_FAILED_APPLICATION_REGISTRATION_FAILED:
+                return "APPLICATION REGISTRATION FAILED";
+            case SCAN_FAILED_INTERNAL_ERROR:
+                return "INTERNAL ERROR";
+            case SCAN_FAILED_FEATURE_UNSUPPORTED:
+                return "FEATURE UNSUPPORTED";
+            case SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES:
+                return "OUT OF HARDWARE RESOURCES";
+            case SCAN_FAILED_SCANNING_TOO_FREQUENTLY:
+                return "SCANNING TOO FREQUENTLY";
+            default:
+                return "UNKNOWN";
         }
     }
 }

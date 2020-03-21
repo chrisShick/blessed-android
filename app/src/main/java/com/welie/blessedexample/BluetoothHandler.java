@@ -1,11 +1,11 @@
 package com.welie.blessedexample;
 
+import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.le.ScanResult;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Handler;
-import android.util.Log;
 
 import com.welie.blessed.BluetoothBytesParser;
 import com.welie.blessed.BluetoothCentral;
@@ -17,15 +17,18 @@ import java.util.Calendar;
 import java.util.Date;
 import java.util.UUID;
 
+import timber.log.Timber;
+
+import static android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_HIGH;
 import static android.bluetooth.BluetoothGattCharacteristic.PROPERTY_WRITE;
 import static android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
+import static com.welie.blessed.BluetoothBytesParser.FORMAT_UINT16;
 import static com.welie.blessed.BluetoothBytesParser.FORMAT_UINT8;
 import static com.welie.blessed.BluetoothBytesParser.bytes2String;
 import static com.welie.blessed.BluetoothPeripheral.GATT_SUCCESS;
 import static java.lang.Math.abs;
 
 public class BluetoothHandler {
-    private final String TAG = BluetoothHandler.class.getSimpleName();
 
     // UUIDs for the Blood Pressure service (BLP)
     private static final UUID BLP_SERVICE_UUID = UUID.fromString("00001810-0000-1000-8000-00805f9b34fb");
@@ -34,6 +37,10 @@ public class BluetoothHandler {
     // UUIDs for the Health Thermometer service (HTS)
     private static final UUID HTS_SERVICE_UUID = UUID.fromString("00001809-0000-1000-8000-00805f9b34fb");
     private static final UUID TEMPERATURE_MEASUREMENT_CHARACTERISTIC_UUID = UUID.fromString("00002A1C-0000-1000-8000-00805f9b34fb");
+
+    // UUIDs for the Heart Rate service (HRS)
+    private static final UUID HRS_SERVICE_UUID = UUID.fromString("0000180D-0000-1000-8000-00805f9b34fb");
+    private static final UUID HEARTRATE_MEASUREMENT_CHARACTERISTIC_UUID = UUID.fromString("00002A37-0000-1000-8000-00805f9b34fb");
 
     // UUIDs for the Device Information service (DIS)
     private static final UUID DIS_SERVICE_UUID = UUID.fromString("0000180A-0000-1000-8000-00805f9b34fb");
@@ -59,7 +66,10 @@ public class BluetoothHandler {
     private final BluetoothPeripheralCallback peripheralCallback = new BluetoothPeripheralCallback() {
         @Override
         public void onServicesDiscovered(BluetoothPeripheral peripheral) {
-            Log.i(TAG, "discovered services");
+            Timber.i("discovered services");
+
+            // Request a new connection priority
+            peripheral.requestConnectionPriority(CONNECTION_PRIORITY_HIGH);
 
             // Read manufacturer and model number from the Device Information Service
             if(peripheral.getService(DIS_SERVICE_UUID) != null) {
@@ -97,27 +107,32 @@ public class BluetoothHandler {
             if(peripheral.getService(HTS_SERVICE_UUID) != null) {
                 peripheral.setNotify(peripheral.getCharacteristic(HTS_SERVICE_UUID, TEMPERATURE_MEASUREMENT_CHARACTERISTIC_UUID), true);
             }
+
+            // Turn on notification for Heart Rate  Service
+            if(peripheral.getService(HRS_SERVICE_UUID) != null) {
+                peripheral.setNotify(peripheral.getCharacteristic(HRS_SERVICE_UUID, HEARTRATE_MEASUREMENT_CHARACTERISTIC_UUID), true);
+            }
         }
 
         @Override
         public void onNotificationStateUpdate(BluetoothPeripheral peripheral, BluetoothGattCharacteristic characteristic, int status) {
             if( status == GATT_SUCCESS) {
                 if(peripheral.isNotifying(characteristic)) {
-                    Log.i(TAG, String.format("SUCCESS: Notify set to 'on' for %s", characteristic.getUuid()));
+                    Timber.i("SUCCESS: Notify set to 'on' for %s", characteristic.getUuid());
                 } else {
-                    Log.i(TAG, String.format("SUCCESS: Notify set to 'off' for %s", characteristic.getUuid()));
+                    Timber.i("SUCCESS: Notify set to 'off' for %s", characteristic.getUuid());
                 }
             } else {
-                Log.e(TAG, String.format("ERROR: Changing notification state failed for %s", characteristic.getUuid()));
+                Timber.e("ERROR: Changing notification state failed for %s", characteristic.getUuid());
             }
         }
 
         @Override
         public void onCharacteristicWrite(BluetoothPeripheral peripheral, byte[] value, BluetoothGattCharacteristic characteristic, int status) {
             if( status == GATT_SUCCESS) {
-                Log.i(TAG, String.format("SUCCESS: Writing <%s> to <%s>", bytes2String(value), characteristic.getUuid().toString()));
+                Timber.i("SUCCESS: Writing <%s> to <%s>", bytes2String(value), characteristic.getUuid().toString());
             } else {
-                Log.i(TAG, String.format("ERROR: Failed writing <%s> to <%s>", bytes2String(value), characteristic.getUuid().toString()));
+                Timber.i("ERROR: Failed writing <%s> to <%s>", bytes2String(value), characteristic.getUuid().toString());
             }
         }
 
@@ -132,11 +147,25 @@ public class BluetoothHandler {
                 Intent intent = new Intent("BluetoothMeasurement");
                 intent.putExtra("BloodPressure", measurement);
                 context.sendBroadcast(intent);
-                Log.d(TAG, String.format("%s", measurement));
+                Timber.d("%s", measurement);
+            }
+            else if(characteristicUUID.equals(TEMPERATURE_MEASUREMENT_CHARACTERISTIC_UUID)) {
+                TemperatureMeasurement measurement = new TemperatureMeasurement(value);
+                Intent intent = new Intent("TemperatureMeasurement");
+                intent.putExtra("Temperature", measurement);
+                context.sendBroadcast(intent);
+                Timber.d("%s", measurement);
+            }
+            else if(characteristicUUID.equals(HEARTRATE_MEASUREMENT_CHARACTERISTIC_UUID)) {
+               HeartRateMeasurement measurement = new HeartRateMeasurement(value);
+                Intent intent = new Intent("HeartRateMeasurement");
+                intent.putExtra("HeartRate", measurement);
+                context.sendBroadcast(intent);
+                Timber.d("%s", measurement);
             }
             else if(characteristicUUID.equals(CURRENT_TIME_CHARACTERISTIC_UUID)) {
                 Date currentTime = parser.getDateTime();
-                Log.i(TAG, String.format("Received device time: %s", currentTime));
+                Timber.i("Received device time: %s", currentTime);
 
                 // Deal with Omron devices where we can only write currentTime under specific conditions
                 if(peripheral.getName().contains("BLEsmart_")) {
@@ -153,15 +182,15 @@ public class BluetoothHandler {
             }
             else if(characteristicUUID.equals(BATTERY_LEVEL_CHARACTERISTIC_UUID)) {
                 int batteryLevel = parser.getIntValue(FORMAT_UINT8);
-                Log.i(TAG, String.format("Received battery level %d%%", batteryLevel));
+                Timber.i("Received battery level %d%%", batteryLevel);
             }
             else if(characteristicUUID.equals(MANUFACTURER_NAME_CHARACTERISTIC_UUID)) {
                 String manufacturer = parser.getStringValue(0);
-                Log.i(TAG, String.format("Received manufacturer: %s", manufacturer));
+                Timber.i("Received manufacturer: %s", manufacturer);
             }
             else if(characteristicUUID.equals(MODEL_NUMBER_CHARACTERISTIC_UUID)) {
                 String modelNumber = parser.getStringValue(0);
-                Log.i(TAG, String.format("Received modelnumber: %s", modelNumber));
+                Timber.i("Received modelnumber: %s", modelNumber);
             }
         }
     };
@@ -171,17 +200,17 @@ public class BluetoothHandler {
 
         @Override
         public void onConnectedPeripheral(BluetoothPeripheral peripheral) {
-            Log.i(TAG, String.format("connected to '%s'", peripheral.getName()));
+            Timber.i("connected to '%s'", peripheral.getName());
         }
 
         @Override
         public void onConnectionFailed(BluetoothPeripheral peripheral, final int status) {
-            Log.e(TAG, String.format("connection '%s' failed with status %d", peripheral.getName(), status ));
+            Timber.e("connection '%s' failed with status %d", peripheral.getName(), status);
         }
 
         @Override
         public void onDisconnectedPeripheral(final BluetoothPeripheral peripheral, final int status) {
-            Log.i(TAG, String.format("disconnected '%s' with status %d", peripheral.getName(), status));
+            Timber.i("disconnected '%s' with status %d", peripheral.getName(), status);
 
             // Reconnect to this device when it becomes available again
             handler.postDelayed(new Runnable() {
@@ -194,9 +223,20 @@ public class BluetoothHandler {
 
         @Override
         public void onDiscoveredPeripheral(BluetoothPeripheral peripheral, ScanResult scanResult) {
-            Log.i(TAG, String.format("Found peripheral '%s'", peripheral.getName()));
+            Timber.i("Found peripheral '%s'", peripheral.getName());
             central.stopScan();
             central.connectPeripheral(peripheral, peripheralCallback);
+        }
+
+        @Override
+        public void onBluetoothAdapterStateChanged(int state) {
+            Timber.i("bluetooth adapter changed state to %d", state);
+            if(state == BluetoothAdapter.STATE_ON) {
+                // Bluetooth is on now, start scanning again
+                // Scan for peripherals with a certain service UUIDs
+                central.startPairingPopupHack();
+                central.scanForPeripheralsWithServices(new UUID[]{BLP_SERVICE_UUID, HTS_SERVICE_UUID, HRS_SERVICE_UUID});
+            }
         }
     };
 
@@ -215,6 +255,6 @@ public class BluetoothHandler {
 
         // Scan for peripherals with a certain service UUIDs
         central.startPairingPopupHack();
-        central.scanForPeripheralsWithServices(new UUID[]{BLP_SERVICE_UUID, HTS_SERVICE_UUID});
+        central.scanForPeripheralsWithServices(new UUID[]{BLP_SERVICE_UUID, HTS_SERVICE_UUID, HRS_SERVICE_UUID});
     }
 }

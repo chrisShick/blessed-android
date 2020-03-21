@@ -8,8 +8,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
-import android.support.annotation.NonNull;
-import android.support.v7.app.AppCompatActivity;
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.TextView;
@@ -18,12 +18,14 @@ import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Locale;
 
+import timber.log.Timber;
+
 public class MainActivity extends AppCompatActivity {
 
     private final String TAG = MainActivity.class.getSimpleName();
-    private TextView bloodpressureValue;
+    private TextView measurementValue;
     private static final int REQUEST_ENABLE_BT = 1;
-    private static final int ACCESS_COARSE_LOCATION_REQUEST = 2;
+    private static final int ACCESS_LOCATION_REQUEST = 2;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -32,8 +34,10 @@ public class MainActivity extends AppCompatActivity {
 
         Log.d(TAG, "onCreate called");
 
+        Timber.plant(new Timber.DebugTree());
+
         setContentView(R.layout.activity_main);
-        bloodpressureValue = (TextView) findViewById(R.id.bloodPressureValue);
+        measurementValue = (TextView) findViewById(R.id.bloodPressureValue);
 
         BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
         if(bluetoothAdapter == null) return;
@@ -50,29 +54,55 @@ public class MainActivity extends AppCompatActivity {
     private void initBluetoothHandler()
     {
         BluetoothHandler.getInstance(getApplicationContext());
-        registerReceiver(dataReceiver, new IntentFilter( "BluetoothMeasurement" ));
+        registerReceiver(bloodPressureDataReceiver, new IntentFilter( "BluetoothMeasurement" ));
+        registerReceiver(temperatureDataReceiver, new IntentFilter( "TemperatureMeasurement" ));
+        registerReceiver(heartRateDataReceiver, new IntentFilter( "HeartRateMeasurement" ));
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        unregisterReceiver(dataReceiver);
+        unregisterReceiver(bloodPressureDataReceiver);
     }
 
-    private final BroadcastReceiver dataReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver bloodPressureDataReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             BloodPressureMeasurement measurement = (BloodPressureMeasurement) intent.getSerializableExtra("BloodPressure");
             DateFormat df = new SimpleDateFormat("dd-MM-yyyy HH:mm:ss", Locale.ENGLISH);
             String formattedTimestamp = df.format(measurement.timestamp);
-            bloodpressureValue.setText(String.format(Locale.ENGLISH, "%.0f/%.0f %s, %.0f bpm\n%s", measurement.systolic, measurement.diastolic, measurement.isMMHG ? "mmHg" : "kpa", measurement.pulseRate, formattedTimestamp));
+            measurementValue.setText(String.format(Locale.ENGLISH, "%.0f/%.0f %s, %.0f bpm\n%s", measurement.systolic, measurement.diastolic, measurement.isMMHG ? "mmHg" : "kpa", measurement.pulseRate, formattedTimestamp));
+        }
+    };
+
+    private final BroadcastReceiver temperatureDataReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            TemperatureMeasurement measurement = (TemperatureMeasurement) intent.getSerializableExtra("Temperature");
+            DateFormat df = new SimpleDateFormat("dd-MM-yyyy HH:mm:ss", Locale.ENGLISH);
+            String formattedTimestamp = df.format(measurement.timestamp);
+            measurementValue.setText(String.format(Locale.ENGLISH, "%.1f %s (%s)\n%s", measurement.temperatureValue, measurement.unit == TemperatureUnit.Celsius ? "celcius" : "fahrenheit", measurement.type, formattedTimestamp));
+        }
+    };
+
+    private final BroadcastReceiver heartRateDataReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            HeartRateMeasurement measurement = (HeartRateMeasurement) intent.getSerializableExtra("HeartRate");
+            measurementValue.setText(String.format(Locale.ENGLISH, "%d bpm", measurement.pulse));
         }
     };
 
     private boolean hasPermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        int targetSdkVersion = getApplicationInfo().targetSdkVersion;
+        if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && targetSdkVersion >= Build.VERSION_CODES.Q) {
+            if (getApplicationContext().checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, ACCESS_LOCATION_REQUEST);
+                return false;
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (getApplicationContext().checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[] { Manifest.permission.ACCESS_COARSE_LOCATION }, ACCESS_COARSE_LOCATION_REQUEST);
+                requestPermissions(new String[] { Manifest.permission.ACCESS_COARSE_LOCATION }, ACCESS_LOCATION_REQUEST);
                 return false;
             }
         }
@@ -82,7 +112,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         switch (requestCode) {
-            case ACCESS_COARSE_LOCATION_REQUEST:
+            case ACCESS_LOCATION_REQUEST:
                 if(grantResults.length > 0) {
                     if(grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                         initBluetoothHandler();

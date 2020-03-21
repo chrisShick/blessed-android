@@ -28,22 +28,24 @@ import android.bluetooth.le.ScanResult;
 public abstract class BluetoothCentralCallback {
 
     /**
-     * Successfully connected with the device.
+     * Successfully connected with a peripheral.
      *
      * @param peripheral the peripheral that was connected.
      */
     public void onConnectedPeripheral(final BluetoothPeripheral peripheral) {}
 
+
     /**
-     * Connecting with the device has failed.
+     * Connecting with the peripheral has failed.
      *
      * @param peripheral the peripheral for which the connection was attempted
      * @param status the status code for the connection failure
      */
     public void onConnectionFailed(final BluetoothPeripheral peripheral, final int status) {}
 
+
     /**
-     * Device disconnected
+     * Peripheral disconnected
      *
      * @param peripheral the peripheral that disconnected.
      * @param status the status code for the disconnection
@@ -59,6 +61,7 @@ public abstract class BluetoothCentralCallback {
      */
     public void onDiscoveredPeripheral(final BluetoothPeripheral peripheral, final ScanResult scanResult) {}
 
+
     /**
      * Scanning failed
      *
@@ -66,4 +69,11 @@ public abstract class BluetoothCentralCallback {
      */
     public void onScanFailed(final int errorCode) {}
 
+
+    /**
+     * Bluetooth adapter status changed
+     *
+     * @param state the current status code for the adapter
+     */
+    public void onBluetoothAdapterStateChanged(final int state) {};
 }
